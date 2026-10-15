@@ -183,3 +183,7 @@ python3 -B -m unittest discover -s tests -v
 
 - 宇树官方 C++ SDK：https://github.com/unitreerobotics/unitree_sdk2
 - 组内 Python 绑定：https://github.com/Yao0454/unitree_sdk2_bindings
+
+## 练习记录
+ 学 git 命令
+
