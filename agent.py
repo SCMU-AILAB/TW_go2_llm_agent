@@ -5,7 +5,13 @@ Agent 核心循环 + 入口测试。
 循环一圈做五件事：请求模型 -> 存回复 -> 判断是否要调工具 -> 执行工具 -> 存结果。
 直到模型不再调用工具、直接给出回答，或达到最大循环次数。
 
+核心函数：
+    run_agent(user_input)   单次任务：给一句指令，跑完返回
+    run_turn(messages)      在给定对话历史上跑一轮（多轮对话时反复调用同一份 messages）
+    build_messages()        构造初始对话历史
+
 运行方式：python agent.py
+交互式入口：python cli.py
 """
 
 from __future__ import annotations
@@ -45,12 +51,31 @@ def create_client() -> OpenAI:
     else:
         load_dotenv()
 
+    try:
+        import httpx2 as httpx  # openai 3.x 内部使用的 HTTP 库
+    except ImportError:  # 兼容其他环境
+        import httpx
+
     from openai import OpenAI
 
     return OpenAI(
         api_key=os.getenv("DEEPSEEK_API_KEY", "sk-placeholder"),
         base_url=os.getenv("LLM_BASE_URL", "https://api.deepseek.com"),
+        # 不读取系统代理环境变量：某些代理软件写入的 socks:// 会让 httpx 启动即报错
+        http_client=httpx.Client(trust_env=False),
     )
+
+
+def build_messages(user_input: str | None = None) -> list[dict[str, Any]]:
+    """新建一段对话历史：系统提示词 +（可选）第一条用户输入。
+
+    多轮对话时只调用一次（不带参数）拿到初始 messages，
+    之后把用户输入直接 append 进同一份列表即可。
+    """
+    messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if user_input is not None:
+        messages.append({"role": "user", "content": user_input})
+    return messages
 
 
 def run_agent(
@@ -61,7 +86,7 @@ def run_agent(
     registry: ToolRegistry | None = None,
     model: str | None = None,
 ) -> str:
-    """运行一次完整的 Agent 任务。
+    """运行一次完整的 Agent 任务（单次）。
 
     Args:
         user_input: 用户的自然语言指令。
@@ -78,16 +103,37 @@ def run_agent(
     if type(max_iterations) is not int or max_iterations < 1:
         raise ValueError("max_iterations 必须是正整数")
 
+    return run_turn(
+        build_messages(user_input),
+        max_iterations,
+        client=client,
+        registry=registry,
+        model=model,
+    )
+
+
+def run_turn(
+    messages: list[dict[str, Any]],
+    max_iterations: int = 5,
+    *,
+    client: OpenAI | None = None,
+    registry: ToolRegistry | None = None,
+    model: str | None = None,
+) -> str:
+    """在给定的对话历史上跑一轮完整的"推理-工具"循环（就地修改 messages）。
+
+    多轮对话时，把同一份 messages 反复传进来即可，历史会持续累积。
+    """
     registry = tr if registry is None else registry
     if client is not None:
-        return _run_loop(user_input, max_iterations, client, registry, model)
+        return _run_loop(messages, max_iterations, client, registry, model)
 
     with create_client() as owned_client:
-        return _run_loop(user_input, max_iterations, owned_client, registry, model)
+        return _run_loop(messages, max_iterations, owned_client, registry, model)
 
 
 def _run_loop(
-    user_input: str,
+    messages: list[dict[str, Any]],
     max_iterations: int,
     client: OpenAI,
     registry: ToolRegistry,
@@ -95,10 +141,6 @@ def _run_loop(
 ) -> str:
     """执行对话循环；这里不负责创建或关闭客户端。"""
     model = model or os.getenv("LLM_MODEL", "deepseek-chat")
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_input},
-    ]
 
     for iteration in range(1, max_iterations + 1):
         print(f"\n===== 第 {iteration} 轮 =====")
@@ -122,6 +164,15 @@ def _run_loop(
             return "[Error]: 模型回复被内容过滤终止，任务尚未完成。"
 
         message = choice.message
+
+        # 思考内容：仅当模型返回 reasoning 字段时才显示。
+        # deepseek-reasoner / Qwen3 等"会思考"的模型有；deepseek-chat 一般没有。
+        reasoning = getattr(message, "reasoning_content", None) or getattr(
+            message, "reasoning", None
+        )
+        if reasoning:
+            print(f"[思考] {reasoning}")
+
         messages.append(message.model_dump(exclude_none=True))
 
         if not message.tool_calls:
